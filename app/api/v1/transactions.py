@@ -7,6 +7,7 @@ from app.api.deps import get_async_session
 from app.core.exceptions import InsufficientFundsError, NotFoundError, ValidationError
 from app.schemas.transaction import TransactionRead, TransferRequest
 from app.services.transaction_service import TransactionService
+from app.worker import send_transaction_email, audit_log_transaction
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -41,18 +42,40 @@ async def transfer_funds(
             # Refresh to get auto-generated fields
             await session.refresh(transaction)
 
-        # Transaction committed successfully at this point
+        # ✅ CRITICAL: Transaction committed and session closed at this point
+        # Now safe to queue background tasks
+        
+        # Queue email notification task
+        send_transaction_email.delay(
+            email="user@example.com",  # In production: fetch from user record
+            amount=str(transaction.amount),
+            status="SUCCESS"
+        )
+        
+        # Queue audit log task
+        audit_log_transaction.delay(
+            transaction_id=str(transaction.id),
+            data={
+                "sender_wallet_id": str(transaction.sender_wallet_id),
+                "receiver_wallet_id": str(transaction.receiver_wallet_id),
+                "amount": str(transaction.amount),
+                "status": transaction.status.value,
+                "created_at": transaction.created_at.isoformat()
+            }
+        )
+        
+        # Return immediately - tasks execute in background
         return transaction
 
     except NotFoundError as e:
-        # Wallet not found - transaction rolled back
+        # Wallet not found - transaction rolled back, no tasks queued
         raise HTTPException(status_code=404, detail=e.message)
     except ValidationError as e:
-        # Invalid input - transaction rolled back
+        # Invalid input - transaction rolled back, no tasks queued
         raise HTTPException(status_code=400, detail=e.message)
     except InsufficientFundsError as e:
-        # Insufficient funds - transaction rolled back
+        # Insufficient funds - transaction rolled back, no tasks queued
         raise HTTPException(status_code=400, detail=e.message)
     except Exception as e:
-        # Unexpected error - transaction rolled back
+        # Unexpected error - transaction rolled back, no tasks queued
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")

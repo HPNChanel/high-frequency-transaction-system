@@ -21,6 +21,7 @@ This project showcases a production-ready transaction system with:
 - **Migrations**: Alembic
 - **Validation**: Pydantic v2
 - **Authentication**: JWT with python-jose, bcrypt
+- **Task Queue**: Celery 5.3+ with Redis broker
 - **Testing**: pytest, pytest-asyncio, Hypothesis
 - **Code Quality**: Black, Ruff, mypy
 - **Containerization**: Docker & Docker Compose
@@ -32,10 +33,13 @@ This project showcases a production-ready transaction system with:
 ├── app/
 │   ├── api/              # API endpoints and routing
 │   ├── core/             # Core configuration and utilities
+│   │   ├── celery_app.py # Celery application instance
+│   │   └── config.py     # Application settings
 │   ├── db/               # Database setup and session management
 │   ├── models/           # SQLAlchemy ORM models
 │   ├── schemas/          # Pydantic schemas for validation
 │   ├── services/         # Business logic layer
+│   ├── worker.py         # Celery task definitions
 │   └── main.py           # Application entry point
 ├── alembic/              # Database migrations
 ├── tests/
@@ -104,10 +108,10 @@ cp .env.example .env
 
 ### Running with Docker
 
-Start all services (PostgreSQL, Redis, and optionally PgAdmin):
+Start all services (PostgreSQL, Redis, Celery worker, and optionally PgAdmin):
 
 ```bash
-# Start core services
+# Start core services (includes Celery worker)
 docker-compose up -d
 
 # Include PgAdmin for database management
@@ -117,6 +121,8 @@ docker-compose --profile admin up -d
 Services will be available at:
 - PostgreSQL: `localhost:5432`
 - Redis: `localhost:6379`
+- FastAPI: `http://localhost:8000`
+- Celery Worker: Running in background (logs via `docker-compose logs celery_worker`)
 - PgAdmin: `http://localhost:5050` (if using admin profile)
 
 ### Database Setup
@@ -139,6 +145,150 @@ The API will be available at:
 - API: `http://localhost:8000`
 - Interactive docs: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
+
+## Celery Background Tasks
+
+The system uses Celery with Redis for asynchronous task processing. Background tasks handle slow I/O operations (email notifications, audit logging) without blocking API responses.
+
+### Architecture
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   FastAPI   │────▶│    Redis    │────▶│   Celery    │
+│   (API)     │     │  (Broker)   │     │  (Worker)   │
+└─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │
+       │                   │                   ▼
+       │                   │           ┌─────────────┐
+       │                   └──────────▶│   Redis     │
+       │                               │  (Backend)  │
+       ▼                               └─────────────┘
+┌─────────────┐
+│ PostgreSQL  │
+│ (Database)  │
+└─────────────┘
+```
+
+### Starting Celery Worker Locally
+
+**Prerequisites**: Redis must be running (either via Docker or locally).
+
+```bash
+# Start Redis (if not using Docker)
+redis-server
+
+# Start Celery worker
+celery -A app.core.celery_app worker --loglevel=info
+```
+
+**With Docker Compose** (recommended):
+```bash
+# Starts all services including Celery worker
+docker-compose up -d
+
+# View Celery worker logs
+docker-compose logs -f celery_worker
+```
+
+### Available Tasks
+
+| Task Name | Description | Parameters |
+|-----------|-------------|------------|
+| `send_transaction_email` | Sends email notification | `email`, `amount`, `status` |
+| `audit_log_transaction` | Writes audit log entry | `transaction_id`, `data` |
+
+### Task Configuration
+
+Tasks are configured in `app/core/celery_app.py`:
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `task_serializer` | `json` | Task parameter serialization format |
+| `result_serializer` | `json` | Task result serialization format |
+| `accept_content` | `["json"]` | Accepted content types |
+| `timezone` | `UTC` | Task timezone |
+| `task_track_started` | `True` | Track when tasks start |
+| `task_time_limit` | `300` | Maximum task execution time (5 min) |
+| `result_expires` | `3600` | Result expiration time (1 hour) |
+
+### Task Retry Configuration
+
+To add retry behavior to tasks, modify the task decorator in `app/worker.py`:
+
+```python
+@celery_app.task(
+    name="send_transaction_email",
+    bind=True,
+    autoretry_for=(Exception,),      # Retry on any exception
+    retry_kwargs={
+        'max_retries': 3,            # Maximum retry attempts
+        'countdown': 60              # Seconds between retries
+    },
+    retry_backoff=True,              # Exponential backoff
+    retry_backoff_max=600,           # Max backoff (10 minutes)
+    retry_jitter=True                # Add randomness to prevent thundering herd
+)
+def send_transaction_email(self, email: str, amount: str, status: str):
+    # Task implementation
+    pass
+```
+
+### Monitoring Task Execution
+
+**View Worker Logs**:
+```bash
+# Docker
+docker-compose logs -f celery_worker
+
+# Local
+celery -A app.core.celery_app worker --loglevel=debug
+```
+
+**Inspect Active Tasks**:
+```bash
+# List active tasks
+celery -A app.core.celery_app inspect active
+
+# List scheduled tasks
+celery -A app.core.celery_app inspect scheduled
+
+# List reserved tasks
+celery -A app.core.celery_app inspect reserved
+```
+
+**Check Queue Status via Redis CLI**:
+```bash
+# Connect to Redis
+redis-cli
+
+# Check queue length
+LLEN celery
+
+# View pending tasks
+LRANGE celery 0 -1
+```
+
+**Using Celery Flower (Web UI)**:
+```bash
+# Install Flower
+pip install flower
+
+# Start Flower monitoring
+celery -A app.core.celery_app flower --port=5555
+```
+Then visit `http://localhost:5555` for a web-based monitoring dashboard.
+
+### Task Execution Flow
+
+1. **API Request**: Client initiates fund transfer
+2. **Database Transaction**: Transfer executes with ACID guarantees
+3. **Commit**: Transaction commits, session closes
+4. **Task Queuing**: Email and audit tasks queued via `.delay()`
+5. **Immediate Response**: API returns result to client (~100ms)
+6. **Background Processing**: Celery worker processes tasks asynchronously
+7. **Result Storage**: Task results stored in Redis backend
+
+**Important**: Tasks are queued AFTER the database transaction commits to prevent sending notifications for rolled-back transactions.
 
 ## Testing
 
@@ -207,8 +357,12 @@ Key environment variables (see `.env.example`):
 | `POSTGRES_DB` | Database name | hfts_db |
 | `REDIS_HOST` | Redis host | localhost |
 | `REDIS_PORT` | Redis port | 6379 |
+| `CELERY_BROKER_URL` | Celery broker URL | redis://localhost:6379/0 |
+| `CELERY_RESULT_BACKEND` | Celery result backend URL | redis://localhost:6379/0 |
 | `SECRET_KEY` | JWT secret key | - |
 | `DEBUG` | Debug mode | false |
+
+**Note**: Celery URLs are automatically constructed from `REDIS_HOST` and `REDIS_PORT` if not explicitly set.
 
 ## Architecture Highlights
 

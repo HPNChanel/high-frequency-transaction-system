@@ -334,3 +334,77 @@
 
 
   - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 13. Implement Concurrency Control Mechanisms
+
+
+
+  - [x] 13.1 Add ConcurrencyError exception class
+
+
+
+
+    - Update `app/core/exceptions.py` to add ConcurrencyError class
+    - ConcurrencyError should extend AppException with status code 409
+    - Include resource type and identifier in error message
+    - _Requirements: 10.4, 10.6_
+
+  - [x] 13.2 Refactor existing transfer_funds to use pessimistic locking
+
+
+
+
+    - Rename current `transfer_funds` implementation to `transfer_funds_pessimistic`
+    - Add comprehensive docstring explaining pessimistic locking behavior
+    - Add inline comments explaining when locks are acquired and released
+    - Create new `transfer_funds` method that delegates to `transfer_funds_pessimistic` for backward compatibility
+    - _Requirements: 10.1, 10.2, 10.7_
+
+  - [x] 13.3 Implement transfer_funds_optimistic method
+
+
+
+
+
+    - Create `transfer_funds_optimistic` method in TransactionService
+    - Read sender wallet WITHOUT locking, store version and balance
+    - Read receiver wallet WITHOUT locking, store version and balance
+    - Perform all validations (amount, existence, self-transfer, sufficient funds)
+    - Update sender wallet with WHERE clause checking version, increment version
+    - Check rowcount - if 0, raise ConcurrencyError
+    - Update receiver wallet with WHERE clause checking version, increment version
+    - Check rowcount - if 0, raise ConcurrencyError
+    - Create transaction record with COMPLETED status
+    - Add comprehensive docstring explaining optimistic locking behavior
+    - _Requirements: 10.3, 10.4, 10.5, 10.6, 10.7_
+
+  - [x] 13.4 Write property test for pessimistic locking concurrency
+
+
+
+
+
+
+    - **Property 13: Pessimistic Locking Prevents Concurrent Modification**
+    - **Validates: Requirements 10.1, 10.2**
+
+
+  - [x] 13.5 Write property test for optimistic locking conflict detection
+
+
+
+
+
+
+    - **Property 14: Optimistic Locking Detects Concurrent Modification**
+    - **Validates: Requirements 10.3, 10.4, 10.5, 10.6**
+
+  - [x] 13.6 Add comparison documentation
+
+
+
+
+    - Create inline comments or docstring section comparing both methods
+    - Document when to use pessimistic vs optimistic locking
+    - Include trade-offs and decision matrix
+    - _Requirements: 10.7_

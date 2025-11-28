@@ -133,3 +133,17 @@ This document specifies the requirements for a High-Frequency Transaction System
 3. WHEN a transfer request fails due to validation errors THEN the System SHALL return HTTP 400 with error details
 4. WHEN a transfer request fails due to non-existent wallet THEN the System SHALL return HTTP 404 with error details
 5. WHEN a transfer request fails due to any error THEN the System SHALL return a JSON response with error type, message, and status code
+
+### Requirement 10: Concurrency Control Mechanisms
+
+**User Story:** As a database expert, I want multiple concurrency control strategies for fund transfers, so that I can choose the optimal approach based on contention levels and performance requirements.
+
+#### Acceptance Criteria
+
+1. WHEN implementing pessimistic locking THEN the System SHALL acquire exclusive row locks on sender and receiver wallets before any balance modifications
+2. WHEN pessimistic locks are held THEN the System SHALL prevent other transactions from reading or modifying the locked wallet rows until commit or rollback
+3. WHEN implementing optimistic locking THEN the System SHALL use the wallet version column to detect concurrent modifications
+4. WHEN optimistic locking detects a version mismatch THEN the System SHALL raise a ConcurrencyError indicating another transaction modified the wallet
+5. WHEN using optimistic locking THEN the System SHALL increment the version number atomically with each wallet balance update
+6. WHEN an optimistic lock conflict occurs THEN the System SHALL provide sufficient information for the caller to implement retry logic
+7. WHEN both concurrency strategies are available THEN the System SHALL provide separate methods allowing developers to choose the appropriate strategy

@@ -10,6 +10,12 @@ python-dotenv>=1.0.0
 bcrypt>=4.1.0
 python-jose[cryptography]>=3.3.0
 
+# Async task processing (Celery with Redis)
+# Celery 5.3.0+ required for Python 3.11+ compatibility and latest features
+# Redis 5.0.0+ required for async support and connection pooling
+celery[redis]>=5.3.0
+redis>=5.0.0
+
 # Development and testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0

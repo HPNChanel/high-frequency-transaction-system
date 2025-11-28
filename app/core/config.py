@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     
+    # Celery - Optional with defaults
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/0"
+    
     # Application
     SECRET_KEY: str
     DEBUG: bool = False
@@ -40,6 +44,16 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
+    
+    @property
+    def celery_broker_url(self) -> str:
+        """Construct Celery broker URL using Redis settings."""
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
+    
+    @property
+    def celery_result_backend(self) -> str:
+        """Construct Celery result backend URL using Redis settings."""
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
 
 # Singleton settings instance - lazily loaded

@@ -305,6 +305,105 @@ Based on the prework analysis, the following properties have been identified and
 
 **Validates: Requirements 8.9**
 
+### Property 13: Pessimistic Locking Prevents Concurrent Modification
+
+*For any* two concurrent transfer attempts involving the same wallet, when using pessimistic locking, the second transaction SHALL wait until the first completes, and both SHALL see consistent wallet balances.
+
+**Validates: Requirements 10.1, 10.2**
+
+### Property 14: Optimistic Locking Detects Concurrent Modification
+
+*For any* wallet update using optimistic locking, if another transaction modifies the wallet between read and update, the System SHALL raise a ConcurrencyError.
+
+**Validates: Requirements 10.3, 10.4, 10.5, 10.6**
+
+## Concurrency Control Strategies
+
+The system provides two concurrency control mechanisms for fund transfers, each optimized for different scenarios:
+
+### Pessimistic Locking (Method 1: "The Safe Way")
+
+**When to Use:**
+- High contention scenarios where conflicts are frequent
+- Critical operations where blocking is acceptable
+- When consistency is more important than throughput
+- Banking systems with frequent transfers between popular accounts
+
+**How It Works:**
+```python
+# Lock rows immediately when reading
+sender_result = await session.execute(
+    select(Wallet).where(Wallet.id == sender_wallet_id).with_for_update()
+)
+```
+
+**Characteristics:**
+- Acquires exclusive row locks using `SELECT ... FOR UPDATE`
+- Other transactions wait (block) until lock is released
+- Guarantees no conflicts - first transaction wins, others wait
+- Higher latency under contention but guaranteed success
+- No retry logic needed
+
+**Trade-offs:**
+- ✅ Zero conflict errors - transactions always succeed if valid
+- ✅ Simpler error handling - no retry logic required
+- ✅ Predictable behavior under load
+- ❌ Lower throughput under high contention
+- ❌ Risk of deadlocks if locks acquired in different orders
+- ❌ Blocked transactions consume database connections
+
+### Optimistic Locking (Method 2: "The Fast Way")
+
+**When to Use:**
+- Low contention scenarios where conflicts are rare
+- Read-heavy workloads with occasional updates
+- When throughput is more important than latency
+- Systems where retry logic is acceptable
+
+**How It Works:**
+```python
+# Read without locking, remember version
+sender_wallet = await get_wallet(sender_wallet_id)
+current_version = sender_wallet.version
+
+# Update with version check
+result = await session.execute(
+    update(Wallet)
+    .where(Wallet.id == sender_wallet_id, Wallet.version == current_version)
+    .values(balance=new_balance, version=current_version + 1)
+)
+
+# Check if update succeeded
+if result.rowcount == 0:
+    raise ConcurrencyError("Wallet was modified by another transaction")
+```
+
+**Characteristics:**
+- No locks during read phase
+- Version column detects concurrent modifications
+- Failed transactions raise ConcurrencyError
+- Requires retry logic in caller
+- Higher throughput when conflicts are rare
+
+**Trade-offs:**
+- ✅ Higher throughput under low contention
+- ✅ No blocking - transactions never wait
+- ✅ No deadlock risk
+- ✅ Better database connection utilization
+- ❌ Conflicts result in errors requiring retry
+- ❌ More complex error handling
+- ❌ Wasted work when conflicts occur
+
+### Decision Matrix
+
+| Scenario | Recommended Strategy | Reason |
+|----------|---------------------|---------|
+| Popular merchant account receiving 1000s of payments | Pessimistic | High contention, blocking acceptable |
+| Peer-to-peer transfers between random users | Optimistic | Low contention, maximize throughput |
+| Payroll processing (batch transfers) | Pessimistic | Predictable, must succeed |
+| Micro-transactions in gaming | Optimistic | High volume, retry acceptable |
+| ATM withdrawals | Pessimistic | Must be reliable, low volume |
+
 ## Error Handling
 
 ### Exception Hierarchy
@@ -338,6 +437,14 @@ class InsufficientFundsError(AppException):
         super().__init__(
             f"Insufficient funds in wallet {wallet_id}: required {required}, available {available}",
             400
+        )
+
+class ConcurrencyError(AppException):
+    """Concurrent modification detected (optimistic locking)"""
+    def __init__(self, resource: str, identifier: str):
+        super().__init__(
+            f"{resource} {identifier} was modified by another transaction. Please retry.",
+            409
         )
 ```
 
@@ -439,20 +546,20 @@ tests/
 
 ### Transaction Service Interface
 
-The `TransactionService` provides business logic for fund transfers with ACID guarantees.
+The `TransactionService` provides business logic for fund transfers with ACID guarantees and multiple concurrency control strategies.
 
 ```python
 # app/services/transaction_service.py
 from decimal import Decimal
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from app.models.wallet import Wallet
 from app.models.transaction import Transaction, TransactionStatus
-from app.core.exceptions import NotFoundError, ValidationError, InsufficientFundsError
+from app.core.exceptions import NotFoundError, ValidationError, InsufficientFundsError, ConcurrencyError
 
 class TransactionService:
-    """Service for handling fund transfer operations"""
+    """Service for handling fund transfer operations with multiple concurrency strategies"""
     
     async def transfer_funds(
         self,
@@ -462,10 +569,44 @@ class TransactionService:
         amount: Decimal
     ) -> Transaction:
         """
-        Transfer funds between two wallets with ACID guarantees.
+        Transfer funds using pessimistic locking (default method for backward compatibility).
+        Delegates to transfer_funds_pessimistic.
+        """
+        return await self.transfer_funds_pessimistic(
+            session, sender_wallet_id, receiver_wallet_id, amount
+        )
+    
+    async def transfer_funds_pessimistic(
+        self,
+        session: AsyncSession,
+        sender_wallet_id: UUID,
+        receiver_wallet_id: UUID,
+        amount: Decimal
+    ) -> Transaction:
+        """
+        Transfer funds using PESSIMISTIC LOCKING (The "Safe" Way).
         
-        This method executes within a database transaction context.
-        All operations either complete successfully or roll back entirely.
+        This method acquires exclusive row locks on both wallets immediately,
+        preventing any other transaction from reading or modifying them until
+        this transaction commits or rolls back.
+        
+        **Concurrency Behavior:**
+        - Uses SELECT ... FOR UPDATE to lock wallet rows
+        - Other transactions attempting to access these wallets will BLOCK
+        - Guarantees no concurrent modifications - zero conflict errors
+        - First transaction to acquire locks wins, others wait in queue
+        
+        **When to Use:**
+        - High contention scenarios (popular merchant accounts)
+        - When consistency is more important than throughput
+        - When blocking is acceptable
+        - When retry logic should be avoided
+        
+        **Trade-offs:**
+        - ✅ No conflicts - transactions always succeed if valid
+        - ✅ Simpler error handling
+        - ❌ Lower throughput under contention
+        - ❌ Blocked transactions consume connections
         
         Args:
             session: Active async database session
@@ -481,13 +622,13 @@ class TransactionService:
             ValidationError: If sender == receiver or amount <= 0
             InsufficientFundsError: If sender balance < amount
         """
-        # Transaction begins here (managed by caller using session.begin())
-        
         # Validation Step 1: Validate amount
         if amount <= Decimal("0"):
             raise ValidationError("Transfer amount must be greater than zero")
         
-        # Validation Step 2: Check sender exists and lock row
+        # Validation Step 2: Check sender exists and LOCK ROW
+        # with_for_update() acquires an exclusive lock on this row
+        # Other transactions trying to read/update this wallet will WAIT here
         sender_result = await session.execute(
             select(Wallet).where(Wallet.id == sender_wallet_id).with_for_update()
         )
@@ -495,7 +636,8 @@ class TransactionService:
         if not sender_wallet:
             raise NotFoundError("Wallet", str(sender_wallet_id))
         
-        # Validation Step 3: Check receiver exists and lock row
+        # Validation Step 3: Check receiver exists and LOCK ROW
+        # Now we hold locks on BOTH wallets - no one else can modify them
         receiver_result = await session.execute(
             select(Wallet).where(Wallet.id == receiver_wallet_id).with_for_update()
         )
@@ -516,9 +658,11 @@ class TransactionService:
             )
         
         # Execution Step 1: Deduct from sender
+        # Safe to modify - we hold the lock, no one else can change this
         sender_wallet.balance -= amount
         
         # Execution Step 2: Add to receiver
+        # Safe to modify - we hold the lock, no one else can change this
         receiver_wallet.balance += amount
         
         # Execution Step 3: Create transaction record
@@ -530,8 +674,145 @@ class TransactionService:
         )
         session.add(transaction)
         
-        # Transaction commits when context manager exits successfully
-        # Transaction rolls back automatically if any exception is raised
+        # Locks are released when transaction commits or rolls back
+        # Other waiting transactions can now proceed
+        
+        return transaction
+    
+    async def transfer_funds_optimistic(
+        self,
+        session: AsyncSession,
+        sender_wallet_id: UUID,
+        receiver_wallet_id: UUID,
+        amount: Decimal
+    ) -> Transaction:
+        """
+        Transfer funds using OPTIMISTIC LOCKING (The "Fast" Way).
+        
+        This method reads wallets WITHOUT locking, performs validations,
+        then uses version numbers to detect if another transaction modified
+        the wallets in the meantime.
+        
+        **Concurrency Behavior:**
+        - Reads wallets without locks - other transactions can proceed
+        - Uses version column to detect concurrent modifications
+        - UPDATE with WHERE version = old_version
+        - If rowcount == 0, someone else modified the wallet - raise error
+        - Caller must implement retry logic
+        
+        **When to Use:**
+        - Low contention scenarios (peer-to-peer transfers)
+        - When throughput is more important than latency
+        - When retry logic is acceptable
+        - Read-heavy workloads
+        
+        **Trade-offs:**
+        - ✅ Higher throughput under low contention
+        - ✅ No blocking - better connection utilization
+        - ✅ No deadlock risk
+        - ❌ Conflicts result in errors requiring retry
+        - ❌ Wasted work when conflicts occur
+        
+        Args:
+            session: Active async database session
+            sender_wallet_id: UUID of the sending wallet
+            receiver_wallet_id: UUID of the receiving wallet
+            amount: Amount to transfer (DECIMAL 18,4)
+            
+        Returns:
+            Transaction: The completed transaction record
+            
+        Raises:
+            NotFoundError: If sender or receiver wallet doesn't exist
+            ValidationError: If sender == receiver or amount <= 0
+            InsufficientFundsError: If sender balance < amount
+            ConcurrencyError: If wallet was modified by another transaction
+        """
+        # Validation Step 1: Validate amount
+        if amount <= Decimal("0"):
+            raise ValidationError("Transfer amount must be greater than zero")
+        
+        # Validation Step 2: Read sender WITHOUT locking
+        # Other transactions can read/modify this wallet concurrently
+        sender_result = await session.execute(
+            select(Wallet).where(Wallet.id == sender_wallet_id)
+        )
+        sender_wallet = sender_result.scalar_one_or_none()
+        if not sender_wallet:
+            raise NotFoundError("Wallet", str(sender_wallet_id))
+        
+        # Remember the version we read - this is our "snapshot"
+        sender_version = sender_wallet.version
+        sender_balance = sender_wallet.balance
+        
+        # Validation Step 3: Read receiver WITHOUT locking
+        receiver_result = await session.execute(
+            select(Wallet).where(Wallet.id == receiver_wallet_id)
+        )
+        receiver_wallet = receiver_result.scalar_one_or_none()
+        if not receiver_wallet:
+            raise NotFoundError("Wallet", str(receiver_wallet_id))
+        
+        # Remember the version we read
+        receiver_version = receiver_wallet.version
+        receiver_balance = receiver_wallet.balance
+        
+        # Validation Step 4: Check self-transfer
+        if sender_wallet_id == receiver_wallet_id:
+            raise ValidationError("Cannot transfer funds to the same wallet")
+        
+        # Validation Step 5: Check sufficient funds
+        if sender_balance < amount:
+            raise InsufficientFundsError(
+                str(sender_wallet_id),
+                amount,
+                sender_balance
+            )
+        
+        # Execution Step 1: Update sender with version check
+        # This UPDATE will only succeed if version hasn't changed
+        # If another transaction modified this wallet, version will be different
+        sender_update_result = await session.execute(
+            update(Wallet)
+            .where(Wallet.id == sender_wallet_id, Wallet.version == sender_version)
+            .values(
+                balance=sender_balance - amount,
+                version=sender_version + 1  # Increment version atomically
+            )
+        )
+        
+        # Check if update succeeded
+        if sender_update_result.rowcount == 0:
+            # Version mismatch - someone else modified this wallet
+            raise ConcurrencyError("Wallet", str(sender_wallet_id))
+        
+        # Execution Step 2: Update receiver with version check
+        receiver_update_result = await session.execute(
+            update(Wallet)
+            .where(Wallet.id == receiver_wallet_id, Wallet.version == receiver_version)
+            .values(
+                balance=receiver_balance + amount,
+                version=receiver_version + 1  # Increment version atomically
+            )
+        )
+        
+        # Check if update succeeded
+        if receiver_update_result.rowcount == 0:
+            # Version mismatch - someone else modified this wallet
+            # Sender update will be rolled back automatically
+            raise ConcurrencyError("Wallet", str(receiver_wallet_id))
+        
+        # Execution Step 3: Create transaction record
+        transaction = Transaction(
+            sender_wallet_id=sender_wallet_id,
+            receiver_wallet_id=receiver_wallet_id,
+            amount=amount,
+            status=TransactionStatus.COMPLETED
+        )
+        session.add(transaction)
+        
+        # If we reach here, both updates succeeded - versions matched
+        # Transaction commits successfully
         
         return transaction
 ```

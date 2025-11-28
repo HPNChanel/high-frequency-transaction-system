@@ -78,3 +78,23 @@ class InsufficientFundsError(AppException):
         self.wallet_id = wallet_id
         self.required = required
         self.available = available
+
+
+class ConcurrencyError(AppException):
+    """Concurrent modification detected exception.
+    
+    Raised when optimistic locking detects that a resource was modified
+    by another transaction between read and update operations.
+    The caller should implement retry logic to handle this error.
+    """
+    
+    def __init__(self, resource: str, identifier: str) -> None:
+        super().__init__(
+            message=(
+                f"{resource} {identifier} was modified by another transaction. "
+                "Please retry."
+            ),
+            status_code=409,
+        )
+        self.resource = resource
+        self.identifier = identifier
