@@ -1,0 +1,418 @@
+# Design Document
+
+## Overview
+
+The High-Frequency Transaction System (Core Banking Lite) is a fintech portfolio project demonstrating professional-grade architecture for handling financial transactions. Built with Python 3.12+, FastAPI (async), PostgreSQL, and SQLAlchemy (async), the system provides user management, wallet operations, and an immutable transaction ledger with financial-grade precision.
+
+The architecture follows the Service-Repository Pattern with clear separation of concerns, enabling scalability, testability, and maintainability.
+
+## Architecture
+
+```mermaid
+graph TB
+    subgraph "API Layer"
+        R[Routers/Controllers]
+    end
+    
+    subgraph "Business Layer"
+        S[Services]
+    end
+    
+    subgraph "Data Layer"
+        REPO[Repositories]
+        DB[(PostgreSQL)]
+        CACHE[(Redis)]
+    end
+    
+    subgraph "Infrastructure"
+        DOCKER[Docker Compose]
+        PGADMIN[PgAdmin]
+    end
+    
+    R --> S
+    S --> REPO
+    REPO --> DB
+    S -.-> CACHE
+    DOCKER --> DB
+    DOCKER --> CACHE
+    DOCKER --> PGADMIN
+    PGADMIN --> DB
+```
+
+### Layer Responsibilities
+
+1. **API Layer (`app/api`)**: HTTP request handling, input validation, response formatting
+2. **Service Layer (`app/services`)**: Business logic, transaction orchestration, validation rules
+3. **Repository Layer (`app/repositories`)**: Data access abstraction, query building
+4. **Data Layer (`app/db`, `app/models`)**: ORM models, database connection, migrations
+
+## Components and Interfaces
+
+### Directory Structure
+
+```
+project-root/
+├── app/
+│   ├── __init__.py
+│   ├── main.py                 # FastAPI application entry point
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── deps.py             # Dependency injection
+│   │   └── v1/
+│   │       ├── __init__.py
+│   │       ├── router.py       # API version router
+│   │       ├── users.py        # User endpoints
+│   │       ├── wallets.py      # Wallet endpoints
+│   │       └── transactions.py # Transaction endpoints
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── config.py           # Pydantic settings
+│   │   ├── security.py         # Password hashing, JWT
+│   │   └── exceptions.py       # Custom exceptions
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── base.py             # Declarative base
+│   │   └── session.py          # Async session management
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── user.py             # User ORM model
+│   │   ├── wallet.py           # Wallet ORM model
+│   │   └── transaction.py      # Transaction ORM model
+│   ├── schemas/
+│   │   ├── __init__.py
+│   │   ├── user.py             # User Pydantic schemas
+│   │   ├── wallet.py           # Wallet Pydantic schemas
+│   │   └── transaction.py      # Transaction Pydantic schemas
+│   └── services/
+│       ├── __init__.py
+│       ├── user_service.py
+│       ├── wallet_service.py
+│       └── transaction_service.py
+├── alembic/
+│   ├── env.py
+│   └── versions/
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py
+│   └── ...
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── .env
+├── alembic.ini
+├── pyproject.toml
+└── requirements.txt
+```
+
+### Core Configuration Interface
+
+```python
+# app/core/config.py
+class Settings(BaseSettings):
+    # Database
+    POSTGRES_HOST: str
+    POSTGRES_PORT: int = 5432
+    POSTGRES_USER: str
+    POSTGRES_PASSWORD: str
+    POSTGRES_DB: str
+    
+    # Redis
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    
+    # Application
+    SECRET_KEY: str
+    DEBUG: bool = False
+    
+    @property
+    def database_url(self) -> str:
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+```
+
+### Database Session Interface
+
+```python
+# app/db/session.py
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_maker() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+```
+
+## Data Models
+
+### Entity Relationship Diagram
+
+```mermaid
+erDiagram
+    USER ||--|| WALLET : owns
+    WALLET ||--o{ TRANSACTION : sends
+    WALLET ||--o{ TRANSACTION : receives
+    
+    USER {
+        uuid id PK
+        string email UK
+        string hashed_password
+        string full_name
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    WALLET {
+        uuid id PK
+        uuid user_id FK,UK
+        decimal_18_4 balance
+        string currency
+        integer version
+        timestamp created_at
+        timestamp updated_at
+    }
+    
+    TRANSACTION {
+        uuid id PK
+        uuid sender_wallet_id FK
+        uuid receiver_wallet_id FK
+        decimal_18_4 amount
+        enum status
+        timestamp created_at
+    }
+```
+
+### User Model
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK, default=uuid4 | Unique identifier |
+| email | String(255) | UNIQUE, NOT NULL, INDEX | User email address |
+| hashed_password | String(255) | NOT NULL | Bcrypt hashed password |
+| full_name | String(255) | NOT NULL | User's display name |
+| is_active | Boolean | NOT NULL, default=True | Account status |
+| created_at | DateTime | NOT NULL, default=now | Record creation time |
+| updated_at | DateTime | NOT NULL, onupdate=now | Last modification time |
+
+### Wallet Model
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK, default=uuid4 | Unique identifier |
+| user_id | UUID | FK(users.id), UNIQUE, NOT NULL | Owner reference |
+| balance | DECIMAL(18,4) | NOT NULL, default=0.0000 | Current balance |
+| currency | String(3) | NOT NULL, default="USD" | ISO currency code |
+| version | Integer | NOT NULL, default=1 | Optimistic lock version |
+| created_at | DateTime | NOT NULL, default=now | Record creation time |
+| updated_at | DateTime | NOT NULL, onupdate=now | Last modification time |
+
+### Transaction Model
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | UUID | PK, default=uuid4 | Unique identifier |
+| sender_wallet_id | UUID | FK(wallets.id), NOT NULL, INDEX | Source wallet |
+| receiver_wallet_id | UUID | FK(wallets.id), NOT NULL, INDEX | Destination wallet |
+| amount | DECIMAL(18,4) | NOT NULL | Transfer amount |
+| status | Enum | NOT NULL, default=PENDING | Transaction state |
+| created_at | DateTime | NOT NULL, default=now | Transaction timestamp |
+
+### Transaction Status Enum
+
+```python
+class TransactionStatus(str, Enum):
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+```
+
+## Correctness Properties
+
+*A property is a characteristic or behavior that should hold true across all valid executions of a system-essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
+
+
+
+Based on the prework analysis, the following properties have been identified and consolidated to eliminate redundancy:
+
+### Property 1: User Schema Round-Trip
+
+*For any* valid User object, serializing to JSON (via Pydantic schema) and deserializing back SHALL produce an equivalent User object with all non-sensitive fields preserved.
+
+**Validates: Requirements 4.4, 4.5**
+
+### Property 2: Wallet Schema Round-Trip with Decimal Precision
+
+*For any* valid Wallet object with balance having up to 4 decimal places, serializing to JSON and deserializing back SHALL produce an equivalent Wallet object with exact decimal precision preserved.
+
+**Validates: Requirements 5.6, 5.7**
+
+### Property 3: Transaction Schema Round-Trip
+
+*For any* valid Transaction object, serializing to JSON and deserializing back SHALL produce an equivalent Transaction object with exact decimal amount precision and valid enum status preserved.
+
+**Validates: Requirements 6.8, 6.9**
+
+### Property 4: Configuration Validation
+
+*For any* set of environment variables missing a required database parameter (POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB), loading the Settings SHALL raise a ValidationError.
+
+**Validates: Requirements 3.1, 3.2**
+
+### Property 5: User Email Uniqueness
+
+*For any* two User creation attempts with identical email addresses, the second attempt SHALL raise an IntegrityError.
+
+**Validates: Requirements 4.2**
+
+### Property 6: Wallet-User One-to-One Constraint
+
+*For any* User that already has a Wallet, attempting to create a second Wallet for that User SHALL raise an IntegrityError.
+
+**Validates: Requirements 5.1**
+
+### Property 7: Transaction Foreign Key Integrity
+
+*For any* Transaction creation with a sender_wallet_id or receiver_wallet_id that does not exist in the Wallets table, the creation SHALL raise an IntegrityError.
+
+**Validates: Requirements 6.2, 6.3**
+
+### Property 8: Financial Decimal Precision
+
+*For any* decimal value with up to 4 decimal places stored in Wallet.balance or Transaction.amount, retrieval SHALL return the exact same decimal value without floating-point errors.
+
+**Validates: Requirements 5.2, 6.4**
+
+### Property 9: Transaction ID Uniqueness
+
+*For any* set of N transactions created, all N transaction IDs SHALL be unique.
+
+**Validates: Requirements 6.1**
+
+## Error Handling
+
+### Exception Hierarchy
+
+```python
+# app/core/exceptions.py
+class AppException(Exception):
+    """Base application exception"""
+    def __init__(self, message: str, status_code: int = 500):
+        self.message = message
+        self.status_code = status_code
+
+class NotFoundError(AppException):
+    """Resource not found"""
+    def __init__(self, resource: str, identifier: str):
+        super().__init__(f"{resource} with id {identifier} not found", 404)
+
+class ConflictError(AppException):
+    """Resource conflict (duplicate, version mismatch)"""
+    def __init__(self, message: str):
+        super().__init__(message, 409)
+
+class ValidationError(AppException):
+    """Input validation failed"""
+    def __init__(self, message: str):
+        super().__init__(message, 422)
+
+class InsufficientFundsError(AppException):
+    """Wallet balance insufficient for transaction"""
+    def __init__(self, wallet_id: str, required: Decimal, available: Decimal):
+        super().__init__(
+            f"Insufficient funds in wallet {wallet_id}: required {required}, available {available}",
+            400
+        )
+```
+
+### Error Response Format
+
+```json
+{
+    "error": {
+        "type": "InsufficientFundsError",
+        "message": "Insufficient funds in wallet abc-123: required 100.0000, available 50.0000",
+        "status_code": 400
+    }
+}
+```
+
+## Testing Strategy
+
+### Testing Framework
+
+- **Unit Testing**: pytest with pytest-asyncio for async test support
+- **Property-Based Testing**: Hypothesis library for Python
+- **Test Database**: SQLite in-memory or PostgreSQL test container
+
+### Unit Testing Approach
+
+Unit tests will cover:
+- Specific examples demonstrating correct behavior
+- Edge cases (empty inputs, boundary values)
+- Error conditions and exception handling
+- Integration points between layers
+
+### Property-Based Testing Approach
+
+Property-based tests will use the Hypothesis library with the following configuration:
+- Minimum 100 iterations per property test
+- Custom strategies for generating valid domain objects
+- Each test tagged with format: `**Feature: high-frequency-transaction-system, Property {number}: {property_text}**`
+
+#### Hypothesis Strategies
+
+```python
+from hypothesis import strategies as st
+from decimal import Decimal
+
+# Strategy for valid email addresses
+email_strategy = st.emails()
+
+# Strategy for DECIMAL(18,4) values
+decimal_18_4_strategy = st.decimals(
+    min_value=Decimal("0"),
+    max_value=Decimal("99999999999999.9999"),
+    places=4
+)
+
+# Strategy for valid User data
+user_strategy = st.fixed_dictionaries({
+    "email": email_strategy,
+    "full_name": st.text(min_size=1, max_size=255),
+    "password": st.text(min_size=8, max_size=128),
+    "is_active": st.booleans()
+})
+
+# Strategy for valid Wallet data
+wallet_strategy = st.fixed_dictionaries({
+    "balance": decimal_18_4_strategy,
+    "currency": st.sampled_from(["USD", "VND", "EUR"])
+})
+
+# Strategy for Transaction status
+status_strategy = st.sampled_from(["PENDING", "COMPLETED", "FAILED"])
+```
+
+### Test File Organization
+
+```
+tests/
+├── conftest.py              # Shared fixtures, database setup
+├── unit/
+│   ├── test_models.py       # ORM model unit tests
+│   ├── test_schemas.py      # Pydantic schema unit tests
+│   └── test_config.py       # Configuration unit tests
+├── properties/
+│   ├── test_schema_roundtrip.py    # Properties 1, 2, 3
+│   ├── test_config_validation.py   # Property 4
+│   ├── test_constraints.py         # Properties 5, 6, 7
+│   └── test_decimal_precision.py   # Property 8
+└── integration/
+    └── test_database.py     # Database integration tests
+```
+
+### Property Test Requirements
+
+1. Each correctness property MUST be implemented by a SINGLE property-based test
+2. Each test MUST be tagged with: `**Feature: high-frequency-transaction-system, Property {number}: {property_text}**`
+3. Each test MUST run minimum 100 iterations
+4. Tests MUST NOT use mocks for core logic validation
