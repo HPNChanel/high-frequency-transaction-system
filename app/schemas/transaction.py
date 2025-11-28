@@ -45,3 +45,21 @@ class TransactionRead(TransactionBase):
     def serialize_status(self, status: TransactionStatus) -> str:
         """Serialize status as string enum value."""
         return status.value
+
+
+class TransferRequest(BaseModel):
+    """Request schema for fund transfer."""
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "sender_wallet_id": "123e4567-e89b-12d3-a456-426614174000",
+                "receiver_wallet_id": "123e4567-e89b-12d3-a456-426614174001",
+                "amount": "100.5000"
+            }
+        }
+    )
+    
+    sender_wallet_id: uuid.UUID = Field(..., description="Source wallet UUID")
+    receiver_wallet_id: uuid.UUID = Field(..., description="Destination wallet UUID")
+    amount: Decimal = Field(..., gt=0, decimal_places=4, description="Transfer amount")

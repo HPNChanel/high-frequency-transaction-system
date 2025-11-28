@@ -287,6 +287,24 @@ Based on the prework analysis, the following properties have been identified and
 
 **Validates: Requirements 6.1**
 
+### Property 10: Transfer Balance Conservation
+
+*For any* successful fund transfer between two wallets, the sum of both wallet balances after the transfer SHALL equal the sum of both wallet balances before the transfer.
+
+**Validates: Requirements 8.7, 8.8**
+
+### Property 11: Transfer Atomicity on Failure
+
+*For any* fund transfer that fails validation (non-existent wallet, insufficient funds, invalid amount, self-transfer), both wallet balances SHALL remain unchanged.
+
+**Validates: Requirements 8.10**
+
+### Property 12: Transfer Creates Completed Transaction
+
+*For any* successful fund transfer, a Transaction record SHALL be created with status COMPLETED and the exact transfer amount.
+
+**Validates: Requirements 8.9**
+
 ## Error Handling
 
 ### Exception Hierarchy
@@ -416,3 +434,232 @@ tests/
 2. Each test MUST be tagged with: `**Feature: high-frequency-transaction-system, Property {number}: {property_text}**`
 3. Each test MUST run minimum 100 iterations
 4. Tests MUST NOT use mocks for core logic validation
+
+## Service Layer Design
+
+### Transaction Service Interface
+
+The `TransactionService` provides business logic for fund transfers with ACID guarantees.
+
+```python
+# app/services/transaction_service.py
+from decimal import Decimal
+from uuid import UUID
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from app.models.wallet import Wallet
+from app.models.transaction import Transaction, TransactionStatus
+from app.core.exceptions import NotFoundError, ValidationError, InsufficientFundsError
+
+class TransactionService:
+    """Service for handling fund transfer operations"""
+    
+    async def transfer_funds(
+        self,
+        session: AsyncSession,
+        sender_wallet_id: UUID,
+        receiver_wallet_id: UUID,
+        amount: Decimal
+    ) -> Transaction:
+        """
+        Transfer funds between two wallets with ACID guarantees.
+        
+        This method executes within a database transaction context.
+        All operations either complete successfully or roll back entirely.
+        
+        Args:
+            session: Active async database session
+            sender_wallet_id: UUID of the sending wallet
+            receiver_wallet_id: UUID of the receiving wallet
+            amount: Amount to transfer (DECIMAL 18,4)
+            
+        Returns:
+            Transaction: The completed transaction record
+            
+        Raises:
+            NotFoundError: If sender or receiver wallet doesn't exist
+            ValidationError: If sender == receiver or amount <= 0
+            InsufficientFundsError: If sender balance < amount
+        """
+        # Transaction begins here (managed by caller using session.begin())
+        
+        # Validation Step 1: Validate amount
+        if amount <= Decimal("0"):
+            raise ValidationError("Transfer amount must be greater than zero")
+        
+        # Validation Step 2: Check sender exists and lock row
+        sender_result = await session.execute(
+            select(Wallet).where(Wallet.id == sender_wallet_id).with_for_update()
+        )
+        sender_wallet = sender_result.scalar_one_or_none()
+        if not sender_wallet:
+            raise NotFoundError("Wallet", str(sender_wallet_id))
+        
+        # Validation Step 3: Check receiver exists and lock row
+        receiver_result = await session.execute(
+            select(Wallet).where(Wallet.id == receiver_wallet_id).with_for_update()
+        )
+        receiver_wallet = receiver_result.scalar_one_or_none()
+        if not receiver_wallet:
+            raise NotFoundError("Wallet", str(receiver_wallet_id))
+        
+        # Validation Step 4: Check self-transfer
+        if sender_wallet_id == receiver_wallet_id:
+            raise ValidationError("Cannot transfer funds to the same wallet")
+        
+        # Validation Step 5: Check sufficient funds
+        if sender_wallet.balance < amount:
+            raise InsufficientFundsError(
+                str(sender_wallet_id),
+                amount,
+                sender_wallet.balance
+            )
+        
+        # Execution Step 1: Deduct from sender
+        sender_wallet.balance -= amount
+        
+        # Execution Step 2: Add to receiver
+        receiver_wallet.balance += amount
+        
+        # Execution Step 3: Create transaction record
+        transaction = Transaction(
+            sender_wallet_id=sender_wallet_id,
+            receiver_wallet_id=receiver_wallet_id,
+            amount=amount,
+            status=TransactionStatus.COMPLETED
+        )
+        session.add(transaction)
+        
+        # Transaction commits when context manager exits successfully
+        # Transaction rolls back automatically if any exception is raised
+        
+        return transaction
+```
+
+### Service Layer Patterns
+
+1. **Dependency Injection**: Services receive database session as parameter
+2. **Transaction Management**: Caller manages transaction boundaries using `async with session.begin()`
+3. **Row Locking**: Use `with_for_update()` to prevent concurrent modification
+4. **Validation First**: All validations before any state changes
+5. **Atomic Operations**: All changes in single transaction
+
+## API Layer Design
+
+### Transfer Request Schema
+
+```python
+# app/schemas/transaction.py (additions)
+from pydantic import BaseModel, Field
+from decimal import Decimal
+from uuid import UUID
+
+class TransferRequest(BaseModel):
+    """Request schema for fund transfer"""
+    sender_wallet_id: UUID = Field(..., description="Source wallet UUID")
+    receiver_wallet_id: UUID = Field(..., description="Destination wallet UUID")
+    amount: Decimal = Field(..., gt=0, decimal_places=4, description="Transfer amount")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "sender_wallet_id": "123e4567-e89b-12d3-a456-426614174000",
+                "receiver_wallet_id": "123e4567-e89b-12d3-a456-426614174001",
+                "amount": "100.5000"
+            }
+        }
+```
+
+### Transaction Endpoint
+
+```python
+# app/api/v1/transactions.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.deps import get_async_session
+from app.services.transaction_service import TransactionService
+from app.schemas.transaction import TransferRequest, TransactionRead
+from app.core.exceptions import NotFoundError, ValidationError, InsufficientFundsError
+
+router = APIRouter(prefix="/transactions", tags=["transactions"])
+
+@router.post("/transfer", response_model=TransactionRead, status_code=200)
+async def transfer_funds(
+    request: TransferRequest,
+    session: AsyncSession = Depends(get_async_session)
+):
+    """
+    Transfer funds between two wallets.
+    
+    This endpoint provides ACID-compliant fund transfers with comprehensive validation.
+    
+    - **sender_wallet_id**: UUID of the wallet sending funds
+    - **receiver_wallet_id**: UUID of the wallet receiving funds
+    - **amount**: Amount to transfer (must be positive, max 4 decimal places)
+    
+    Returns the completed transaction record.
+    """
+    service = TransactionService()
+    
+    try:
+        # Begin atomic transaction - commits on success, rolls back on exception
+        async with session.begin():
+            transaction = await service.transfer_funds(
+                session=session,
+                sender_wallet_id=request.sender_wallet_id,
+                receiver_wallet_id=request.receiver_wallet_id,
+                amount=request.amount
+            )
+            # Refresh to get auto-generated fields
+            await session.refresh(transaction)
+            
+        # Transaction committed successfully at this point
+        return transaction
+        
+    except NotFoundError as e:
+        # Wallet not found - transaction rolled back
+        raise HTTPException(status_code=404, detail=e.message)
+    except ValidationError as e:
+        # Invalid input - transaction rolled back
+        raise HTTPException(status_code=400, detail=e.message)
+    except InsufficientFundsError as e:
+        # Insufficient funds - transaction rolled back
+        raise HTTPException(status_code=400, detail=e.message)
+    except Exception as e:
+        # Unexpected error - transaction rolled back
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+```
+
+### API Router Integration
+
+```python
+# app/api/v1/router.py
+from fastapi import APIRouter
+from app.api.v1 import transactions
+
+api_router = APIRouter()
+api_router.include_router(transactions.router)
+```
+
+### Error Response Examples
+
+**404 Not Found:**
+```json
+{
+    "detail": "Wallet with id 123e4567-e89b-12d3-a456-426614174000 not found"
+}
+```
+
+**400 Bad Request (Insufficient Funds):**
+```json
+{
+    "detail": "Insufficient funds in wallet 123e4567-e89b-12d3-a456-426614174000: required 100.0000, available 50.0000"
+}
+```
+
+**400 Bad Request (Validation):**
+```json
+{
+    "detail": "Transfer amount must be greater than zero"
+}
+```

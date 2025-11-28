@@ -104,3 +104,32 @@ This document specifies the requirements for a High-Frequency Transaction System
 2. WHEN database sessions are requested THEN the System SHALL provide async session management with proper cleanup
 3. WHEN the database URL is constructed THEN the System SHALL use the asyncpg driver for PostgreSQL
 4. WHEN database models are defined THEN the System SHALL use a declarative base class for inheritance
+
+### Requirement 8: Fund Transfer Operations
+
+**User Story:** As a user, I want to transfer funds between wallets with ACID guarantees, so that my transactions are reliable and my balance is always accurate.
+
+#### Acceptance Criteria
+
+1. WHEN a fund transfer is initiated THEN the System SHALL execute all operations within a single atomic database transaction
+2. WHEN a fund transfer is requested with a non-existent sender wallet THEN the System SHALL raise a NotFoundError
+3. WHEN a fund transfer is requested with a non-existent receiver wallet THEN the System SHALL raise a NotFoundError
+4. WHEN a fund transfer is requested where sender and receiver are identical THEN the System SHALL raise a ValidationError
+5. WHEN a fund transfer is requested with an amount less than or equal to zero THEN the System SHALL raise a ValidationError
+6. WHEN a fund transfer is requested with an amount greater than sender balance THEN the System SHALL raise an InsufficientFundsError
+7. WHEN a valid fund transfer is executed THEN the System SHALL deduct the amount from the sender wallet balance
+8. WHEN a valid fund transfer is executed THEN the System SHALL add the amount to the receiver wallet balance
+9. WHEN a valid fund transfer is executed THEN the System SHALL create a Transaction record with status COMPLETED
+10. WHEN any validation or execution step fails THEN the System SHALL rollback all changes and leave wallet balances unchanged
+
+### Requirement 9: Transfer API Endpoint
+
+**User Story:** As a client application, I want a REST API endpoint to initiate fund transfers, so that I can integrate transaction functionality into my application.
+
+#### Acceptance Criteria
+
+1. WHEN a POST request is made to the transfer endpoint THEN the System SHALL accept sender_wallet_id, receiver_wallet_id, and amount as input
+2. WHEN a transfer request is successfully processed THEN the System SHALL return HTTP 200 with the created Transaction object
+3. WHEN a transfer request fails due to validation errors THEN the System SHALL return HTTP 400 with error details
+4. WHEN a transfer request fails due to non-existent wallet THEN the System SHALL return HTTP 404 with error details
+5. WHEN a transfer request fails due to any error THEN the System SHALL return a JSON response with error type, message, and status code

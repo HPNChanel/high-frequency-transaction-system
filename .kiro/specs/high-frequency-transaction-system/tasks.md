@@ -246,3 +246,91 @@
     - Execute pytest with hypothesis tests
     - Verify all 9 properties pass with 100+ iterations
     - _Requirements: All correctness properties_
+
+- [x] 10. Implement Transaction Service Layer
+
+
+
+
+
+
+  - [x] 10.1 Create TransactionService class with transfer_funds method
+
+
+    - Create `app/services/transaction_service.py` with TransactionService class
+    - Implement `transfer_funds` async method accepting session, sender_wallet_id, receiver_wallet_id, amount
+    - Add validation for amount > 0
+    - Add validation for sender wallet exists (with row locking using with_for_update)
+    - Add validation for receiver wallet exists (with row locking using with_for_update)
+    - Add validation for sender != receiver
+    - Add validation for sufficient funds
+    - Implement balance deduction from sender
+    - Implement balance addition to receiver
+    - Create Transaction record with COMPLETED status
+    - Add comprehensive docstring explaining ACID guarantees and transaction management
+    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 8.8, 8.9, 8.10_
+
+  - [x] 10.2 Write property test for balance conservation
+
+
+    - **Property 10: Transfer Balance Conservation**
+    - **Validates: Requirements 8.7, 8.8**
+
+  - [x] 10.3 Write property test for transfer atomicity on failure
+
+
+    - **Property 11: Transfer Atomicity on Failure**
+    - **Validates: Requirements 8.10**
+
+  - [x] 10.4 Write property test for completed transaction creation
+
+
+    - **Property 12: Transfer Creates Completed Transaction**
+    - **Validates: Requirements 8.9**
+
+- [x] 11. Implement Transfer API Endpoint
+
+
+
+
+
+
+
+  - [x] 11.1 Add TransferRequest schema to transaction schemas
+
+    - Update `app/schemas/transaction.py` with TransferRequest class
+    - Define sender_wallet_id, receiver_wallet_id, amount fields
+    - Add validation for amount > 0 and decimal_places=4
+    - Add example in Config class
+    - _Requirements: 9.1_
+
+  - [x] 11.2 Create transactions router with transfer endpoint
+
+
+    - Create `app/api/v1/transactions.py` with APIRouter
+    - Implement POST `/transfer` endpoint
+    - Use dependency injection for database session
+    - Instantiate TransactionService
+    - Call transfer_funds within async with session.begin() context
+    - Handle NotFoundError and return HTTP 404
+    - Handle ValidationError and return HTTP 400
+    - Handle InsufficientFundsError and return HTTP 400
+    - Handle generic exceptions and return HTTP 500
+    - Return TransactionRead response on success
+    - Add comprehensive docstring
+    - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
+
+
+  - [x] 11.3 Integrate transactions router into API v1 router
+
+    - Create or update `app/api/v1/router.py` to include transactions router
+    - Register router with main FastAPI app in `app/main.py`
+    - _Requirements: 9.1_
+
+- [x] 12. Checkpoint - Ensure all tests pass
+
+
+
+
+
+  - Ensure all tests pass, ask the user if questions arise.
